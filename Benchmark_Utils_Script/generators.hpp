@@ -347,7 +347,8 @@ public:
       record=buffRecords[buffTop++];
       pos=0;
       currSeq=string(record.seq);
-    //  cout<<currSeq<<endl;
+      return generateElement(res);
+      cout<<currSeq<<endl;
     }
     string kmer=currSeq.substr(pos,kSize);
     // for(int i=0;i<pos;i++)
