@@ -333,7 +333,7 @@ public:
 
   bool generateElement(uint64_t& res)
   {
-    if(pos>currSeq.size()-kSize)
+    if((int)pos>(int)currSeq.size()-(int)kSize)
     {
       if(buffRecords.size()==buffTop)
       {
@@ -348,8 +348,9 @@ public:
       pos=0;
       currSeq=string(record.seq);
       return generateElement(res);
-      cout<<currSeq<<endl;
-    }
+     }
+    //    cout<<currSeq<<" "<<pos<<" "<<kSize<<" "<<currSeq.size()<<endl;
+
     string kmer=currSeq.substr(pos,kSize);
     // for(int i=0;i<pos;i++)
     // cout<<" ";
