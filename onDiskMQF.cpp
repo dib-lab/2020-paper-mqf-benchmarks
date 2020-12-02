@@ -22,6 +22,9 @@
 #include <map>
 #include "utils.h"
 #include <type_traits>
+#include <stxxl/vector>
+#include <stxxl/io>
+#include <stxxl/stream>
 
 namespace onDiskMQF_Namespace{
 /******************************************************************
@@ -52,6 +55,270 @@ uint64_t bitmaskLookup[]={0,1, 3, 7, 15, 31, 63, 127, 255, 511, 1023,
 2251799813685247, 4503599627370495, 9007199254740991, 18014398509481983, 36028797018963967, 72057594037927935, 144115188075855871, 288230376151711743, 576460752303423487, 1152921504606846975,
 2305843009213693951, 4611686018427387903, 9223372036854775807, 18446744073709551615};
 
+
+
+template<uint64_t bitsPerSlot=64>
+class _onDiskMQF: public onDiskMQF {
+private:
+  bool spin_lock(uint64_t hash_bucket_index, bool spin, bool flag);
+  void unlock(uint64_t hash_bucket_index, bool flag);
+  void modify_metadata(uint64_t *metadata, int cnt);
+
+  int is_runend(uint64_t index);
+  int is_occupied(uint64_t index);
+  uint64_t _get_slot(uint64_t index);
+  void _set_slot(uint64_t index, uint64_t value);
+  void set_slot(uint64_t index, uint64_t value);
+  uint64_t get_slot(uint64_t index);
+  uint64_t get_fixed_counter(uint64_t index);
+  void set_fixed_counter(uint64_t index,uint64_t value);
+  uint64_t _get_label(uint64_t index);
+  void set_label(uint64_t index,uint64_t value);
+  void super_get(uint64_t index,uint64_t* slot,uint64_t *fcounter);
+  void super_set(uint64_t index,uint64_t slot,uint64_t fcounter);
+  uint64_t run_end(uint64_t hash_bucket_index);
+  uint64_t block_offset(uint64_t blockidx);
+  int offset_lower_bound(uint64_t slot_index);
+  int is_empty2(uint64_t slot_index);
+  int might_be_empty(uint64_t slot_index);
+  int probably_is_empty(uint64_t slot_index);
+  uint64_t find_first_empty_slot(uint64_t from);
+  void shift_remainders(const uint64_t start_index, const uint64_t empty_index);
+  void find_next_n_empty_slots(uint64_t from, uint64_t n,uint64_t *indices);
+  void shift_slots(int64_t first, uint64_t last, uint64_t distance);
+  void shift_runends(int64_t first, uint64_t last, uint64_t distance);
+  void insert_replace_slots_and_shift_remainders_and_runends_and_offsets(
+            int operation,uint64_t bucket_index,uint64_t overwrite_index,
+            const uint64_t *remainders,const uint64_t	*fixed_size_counters,
+            uint64_t total_remainders,uint64_t noverwrites);
+  void remove_replace_slots_and_shift_remainders_and_runends_and_offsets(
+            int operation,uint64_t bucket_index,uint64_t overwrite_index,
+            const uint64_t *remainders,const uint64_t	*fixed_size_counters,
+            uint64_t total_remainders,uint64_t noverwrites);
+  uint64_t *encode_counter(uint64_t remainder, uint64_t counter, uint64_t *slots, uint64_t *fixed_size_counters);
+  uint64_t decode_counter(uint64_t index, uint64_t *remainder, uint64_t *count);
+  bool insert1(__uint128_t hash, bool lock, bool spin);
+  bool _insert(__uint128_t hash, uint64_t count, bool lock, bool spin);
+
+public:
+    typedef stxxl::vector< onDisk_qfblock<bitsPerSlot>, 4,
+            stxxl::lru_pager<8>,
+            sizeof(onDisk_qfblock<bitsPerSlot>)*1024,
+            stxxl::RC,
+            stxxl::uint64>  stxxlVector;
+    stxxlVector* blocks;
+    string filename;
+	stxxl::syscall_file* OutputFile;
+/*!
+@breif initialize mqf .
+
+@param Qf* qf : pointer to the Filter.
+@param uint64_t nslots : Number of slots in the filter. Maximum number of items to be inserted depends on this number.
+@param uint64_t key_bits: Number of bits in the hash values. This number should equal log2(nslots) +r. Accuracy depends on r.
+@param uint64_t label_bits: Number of bits in label value.
+@param uint64_t fixed_counter_size: Fixed counter size. must be > 0.
+@param bool mem: Flag to create the filter on memeory. IF false, mmap is used.
+@param const char * path: In case of mmap. Path of the file used to pack the filter.
+@param uint32_t seed: useless value. To be removed
+    */
+
+_onDiskMQF(uint64_t nslots, uint64_t key_bits, uint64_t label_bits,uint64_t fixed_counter_size,const char * path);
+_onDiskMQF(const char * path);
+
+void reset() override;
+
+~_onDiskMQF(){
+	_onDiskMQF<bitsPerSlot>* qf=this;
+	//assert(qf->blocks != NULL);
+
+	qf->metadata->noccupied_slots=0;
+	if(qf->metadata->labels_map!=NULL){
+		delete qf->metadata->labels_map;
+		qf->metadata->labels_map=NULL;
+	}
+	free(qf->mem->locks);
+	free(qf->mem);
+	free(qf->metadata);
+
+	qf->blocks->flush();
+	delete blocks;
+	delete OutputFile;
+
+}
+inline typename stxxlVector::iterator  get_block(uint64_t block_index)
+{
+    typename stxxlVector::iterator it = (this->blocks)->begin();
+
+    it+=block_index;
+    return it;
+}
+inline typename stxxlVector::const_iterator get_block_const( uint64_t block_index)
+{
+    typename stxxlVector::const_iterator it = this->blocks->cbegin();
+    it+=block_index;
+    return it;
+}
+
+void copy(onDiskMQF *dest)override;
+
+/*!
+  @breif Increment the counter for this item by count.
+
+  @param Qf* qf : pointer to the Filter
+  @param uint64_t key : hash of the item to be insertedItems
+  @param uint64_t count: Count to be added
+  @param bool lock: For Multithreading, Lock the slot used by the current thread so that other threads can't change the value
+  @param bool spin: For Multithreading, If there is a lock on the target slot. wait until the lock is freed and insert the count.
+
+  @return bool: True if the item is inserted correctly.
+ */
+bool insert( uint64_t key, uint64_t count,
+               bool lock=false, bool spin=false)override;
+
+
+/* Remove all instances of this key/value pair. */
+//void onDiskMQF_delete_key_value(onDiskMQF*qf, uint64_t key, uint64_t value);
+
+/* Remove all instances of this key. */
+//void onDiskMQF_delete_key(onDiskMQF*qf, uint64_t key);
+
+/* Replace the association (key, oldvalue, count) with the association
+   (key, newvalue, count). If there is already an association (key,
+   newvalue, count'), then the two associations will be merged and
+   their counters will be summed, resulting in association (key,
+   newvalue, count' + count). */
+//void replace( uint64_t key, uint64_t oldvalue, uint64_t newvalue);
+
+/* Lookup the value associated with key.  Returns the count of that
+   key/value pair in the QF.  If it returns 0, then, the key is not
+   present in the QF. Only returns the first value associated with key
+   in the QF.  If you want to see others, use an iterator. */
+//uint64_t query( uint64_t key, uint64_t *value);
+
+/*!
+@breif Return the number of times key has been inserted, with any value,
+   into qf.
+
+@param Qf* qf : pointer to the Filter.
+@param uint64_t key : hash of the item.
+
+@return uint64_t the count associated with the input key.
+    */
+uint64_t count_key( uint64_t key)override;
+
+/*!
+@breif Decrement the counter for this item by count.
+
+@param	Qf* qf : pointer to the Filter
+@param	uint64_t key : hash of the item to be removed
+@param	uint64_t count: Count to be removed
+@param	bool lock: For Multithreading, Lock the slot used by the current thread so that other threads can't change the value
+@param	bool spin: For Multithreading, If there is a lock on the target slot. wait until the lock is freed and insert the count.
+
+@return bool: Returns true if the item is removed successfully.
+ */
+bool remove( uint64_t hash, uint64_t count,  bool lock=false, bool spin=false)override;
+
+
+/*!
+  @breif Add Label to item.
+
+  @param Qf* qf : pointer to the Filter
+  @param uint64_t key : hash of the item to be insertedItems
+  @param uint64_t label: label to be added
+  @param bool lock: For Multithreading, Lock the slot used by the current thread so that other threads can't change the value
+  @param bool spin: For Multithreading, If there is a lock on the target slot. wait until the lock is freed and insert the count.
+
+  @return bool: True if the item is inserted correctly.
+ */
+uint64_t add_label( uint64_t key, uint64_t label, bool lock=false, bool spin=false)override;
+/*!
+@breif Return the label associated with a given item.
+
+@param Qf* qf : pointer to the Filter.
+@param uint64_t key : hash of the item.
+
+@return uint64_t the label associated with the input key.
+    */
+uint64_t get_label(uint64_t key)override;
+/*!
+@breif delete the label associated with a given item.
+
+@param Qf* qf : pointer to the Filter.
+@param uint64_t key : hash of the item.
+
+@return bool: Returns true if the item is removed successfully.
+    */
+uint64_t remove_label(uint64_t key, bool lock=false, bool spin=false)override;
+
+/* Initialize an iterator */
+bool getIterator(onDiskMQFIterator *qfi, uint64_t position);
+
+bool findIterator(onDiskMQFIterator  *qfi, uint64_t key);
+
+
+/* For debugging */
+void dump()override;
+void dump_block(uint64_t i)override;
+//
+// /*! write data structure of to the disk */
+ void serialize()override;
+//
+// /* read data structure off the disk */
+//void deserialize(onDiskMQF* qff,const char *filename);
+//
+// /* mmap the QF from disk. */
+ void read( const char *path)override;
+//
+// /* merge two QFs into the third one. */
+// static void merge(onDiskMQF*qfa, onDiskMQF*qfb, onDiskMQF*qfc);
+//
+// void onDiskMQF_intersect(onDiskMQF *qfa, onDiskMQF *qfb, onDiskMQF *qfc);
+//
+// void onDiskMQF_subtract(onDiskMQF *qfa, onDiskMQF *qfb, onDiskMQF*qfc);
+// /* merge multiple QFs into the final QF one. */
+// void onDiskMQF_multi_merge(onDiskMQF *qf_arr[], int nqf, onDiskMQF *qfr);
+//
+
+/*! @breif Invertiable merge function adds label for each key and creates index structure. The index is map of an integer and vector of integers where the integer is the value of the labels and vector on integers is the ids of the source filters.
+
+@param Qf* qf_arr : input array of filters
+@param int nqf: number of filters
+@param QF* qfr: pointer to the output filter.
+@param std::map<uint64_t, std::vector<int> > *inverted_index_ptr: Pointer to the output index.
+*/
+// void onDiskMQF_invertable_merge(onDiskMQF *qf_arr[], int nqf, onDiskMQF *qfr);
+// void onDiskMQF_invertable_merge_no_count(onDiskMQF *qf_arr[], int nqf, onDiskMQF *qfr);
+//
+
+/*! @breif Resize the filter into a bigger or smaller one
+
+@param Qf* qf : pointer to the Filter
+@param uint64_t newQ: new number of slots(Q). the slot size will be recalculated to keep the range constant.
+@param string originalFilename(optional): dump the current filter to the disk to free space for the new filter. Filename is provided as the content of the string.
+@param string newFilename(optional): the new filter is created on disk. Filename is provided as the content of the string.
+
+@return QF: New Quotient Filter.
+*/
+//onDiskMQF* onDiskMQF_resize(onDiskMQF* qf, int newQ, const char * originalFilename=NULL, const char * newFilename=NULL);
+/* find cosine similarity between two QFs. */
+//uint64_t onDiskMQF_inner_product(onDiskMQF *qfa, onDiskMQF *qfb);
+
+/* magnitude of a QF. */
+//uint64_t onDiskMQF_magnitude(onDiskMQF *qf);
+/* return the filled space(percent) */
+int space()override;
+
+//bool onDiskMQF_equals(onDiskMQF *qfa, onDiskMQF *qfb);
+
+bool general_lock(bool spin)override;
+void general_unlock()override;
+
+//void onDiskMQF_migrate(onDiskMQF* source, onDiskMQF* destination);
+void migrateFromQF(QF* source) override;
+bool getForIterator(onDiskMQFIterator* qfi,uint64_t *key, uint64_t *value, uint64_t *count);
+int nextForIterator(onDiskMQFIterator *qfi);
+};
 //#define BITMASK(nbits) ((nbits) == 64 ? 0xffffffffffffffff : (1ULL << (nbits)) \
 												- 1ULL)
 #define BITMASK(nbits) bitmaskLookup[nbits]
@@ -387,7 +654,7 @@ inline void writeAndFreeBlocks(uint64_t memoryBufferIndex)
 // 	 // printf("block = %p\n",(void*)(((char *)qf->blocks) + block_index * (sizeof(qfblock) +
 // 	 // 					 qf->metadata->bits_per_slot * 8 +
 // 	 // 					8*qf->metadata->fixed_counter_size +
-// 	 // 					8*qf->metadata->tag_bits
+// 	 // 					8*qf->metadata->label_bits
 // 	 // 				 )) );
 // 	 //printf("blocks start=%p\n",qf->blocks );
 // 	// uint64_t BasepointerIndex= block_index / qf->diskParams->nBlocksPerPointer;
@@ -536,17 +803,17 @@ template<uint64_t bitsPerSlot>
 }
 
 template<uint64_t bitsPerSlot>
-  inline uint64_t _onDiskMQF<bitsPerSlot>::_get_tag(uint64_t index)
+  inline uint64_t _onDiskMQF<bitsPerSlot>::_get_label(uint64_t index)
 {
 	_onDiskMQF<bitsPerSlot> *qf=this;
-	uint64_t mask=BITMASK(qf->metadata->tag_bits);
+	uint64_t mask=BITMASK(qf->metadata->label_bits);
 	uint64_t t=_get_slot(index);
 	t >>= (qf->metadata->fixed_counter_size+qf->metadata->key_remainder_bits);
 	return t&mask;
 }
 
 template<uint64_t bitsPerSlot>
-  inline void _onDiskMQF<bitsPerSlot>::set_tag(uint64_t index,uint64_t value)
+  inline void _onDiskMQF<bitsPerSlot>::set_label(uint64_t index,uint64_t value)
 {
 	_onDiskMQF<bitsPerSlot> *qf=this;
 	uint64_t original_value=_get_slot(index);
@@ -675,7 +942,7 @@ template<uint64_t bitsPerSlot>
   inline int _onDiskMQF<bitsPerSlot>::offset_lower_bound(uint64_t slot_index)
 {
 	_onDiskMQF<bitsPerSlot> *qf=this;
-	typename stxxl::vector<onDisk_qfblock<bitsPerSlot> >::const_iterator  b = qf->get_block_const( slot_index / SLOTS_PER_BLOCK);
+	typename stxxlVector::const_iterator  b = qf->get_block_const( slot_index / SLOTS_PER_BLOCK);
 	const uint64_t slot_offset = slot_index % SLOTS_PER_BLOCK;
 	const uint64_t boffset = b->offset;
 	const uint64_t occupieds = b->occupieds[0] & BITMASK(slot_offset+1);
@@ -712,7 +979,6 @@ template<uint64_t bitsPerSlot>
 template<uint64_t bitsPerSlot>
   inline uint64_t _onDiskMQF<bitsPerSlot>::find_first_empty_slot(uint64_t from)
 {
-	_onDiskMQF<bitsPerSlot> *qf=this;
 	do {
 		int t = offset_lower_bound( from);
 		if(t<0)
@@ -811,11 +1077,11 @@ for(int j=0;j<64 && (j+64*i)<qf->metadata->xnslots;j++)
 		printf("%lu ", get_fixed_counter(j+64*i));
 	}
 
-	printf("\n tags \n");
+	printf("\n labels \n");
 
 	for(int j=0;j<64&& (j+64*i)<qf->metadata->xnslots;j++)
 	{
-		printf("%lu ", _get_tag(j+64*i));
+		printf("%lu ", _get_label(j+64*i));
 	}
 
 
@@ -933,7 +1199,7 @@ template<uint64_t bitsPerSlot>
 //
 // }
 
-//   inline void shift_tags(QF *qf, int64_t first, uint64_t last,
+//   inline void shift_labels(QF *qf, int64_t first, uint64_t last,
 // 																 uint64_t distance)
 // {
 // 	assert(last < qf->metadata->xnslots && distance < 64);
@@ -943,7 +1209,7 @@ template<uint64_t bitsPerSlot>
 // 	uint64_t bend = (last + distance + 1) % 64;
 // 	uint64_t* curr, *prev;
 // 	uint64_t tmp =last_word, tmp_bend=bend;
-// 	for(int i=0;i<qf->metadata->tag_bits;i++){
+// 	for(int i=0;i<qf->metadata->label_bits;i++){
 // 		last_word=tmp;
 // 		bend=tmp_bend;
 // 		if (last_word != first_word) {
@@ -986,7 +1252,7 @@ template<uint64_t bitsPerSlot>
 	uint64_t insert_index = overwrite_index + noverwrites;
 	if(qf->metadata->noccupied_slots+ninserts > qf->metadata->maximum_occupied_slots )
 	{
-		throw std::overflow_error("QF is 95% full, cannot insert more items.");
+		throw std::overflow_error("Buffered QF is 95% full, cannot insert more items.");
 	}
 	//printf("remainder =%lu ,overwrite_index = %lu , insert_index=%lu , operation=%d, noverwites=%lu total_remainders=%lu nnserts=%lu \n", remainders[0],overwrite_index,insert_index,operation,noverwrites,total_remainders,ninserts);
 	if (ninserts > 0) {
@@ -1013,8 +1279,8 @@ template<uint64_t bitsPerSlot>
     //
     //
 		// for (i = 0; i < ninserts - 1; i++)
-		// 	shift_tags( empties[i+1] + 1, empties[i] - 1, i + 1);
-		// shift_tags( insert_index, empties[ninserts - 1] - 1, ninserts);
+		// 	shift_labels( empties[i+1] + 1, empties[i] - 1, i + 1);
+		// shift_labels( insert_index, empties[ninserts - 1] - 1, ninserts);
     //
 
 
@@ -1093,8 +1359,8 @@ template<uint64_t bitsPerSlot>
 	for (i = 0; i < total_remainders; i++){
 		set_slot( overwrite_index + i, remainders[i]);
 		set_fixed_counter( overwrite_index + i, fcounters[i]);
-		if(qf->metadata->tag_bits>0)
-			set_tag( overwrite_index + i, 0);
+		if(qf->metadata->label_bits>0)
+			set_label( overwrite_index + i, 0);
 	}
 
 
@@ -1128,8 +1394,8 @@ template<uint64_t bitsPerSlot>
 		if (current_bucket <= current_slot) {
 			set_slot( current_slot, get_slot( current_slot + current_distance));
 			set_fixed_counter( current_slot, get_fixed_counter( current_slot + current_distance));
-			if(qf->metadata->tag_bits>0)
-				set_tag( current_slot, _get_tag( current_slot + current_distance));
+			if(qf->metadata->label_bits>0)
+				set_label( current_slot, _get_label( current_slot + current_distance));
 
 			if (is_runend( current_slot) !=
 					is_runend( current_slot + current_distance))
@@ -1141,8 +1407,8 @@ template<uint64_t bitsPerSlot>
 			for (i = current_slot; i < current_slot + current_distance; i++) {
 				set_slot( i, 0);
 				set_fixed_counter(i,0);
-				if(qf->metadata->tag_bits>0)
-					set_tag(i,0);
+				if(qf->metadata->label_bits>0)
+					set_label(i,0);
 				METADATA_WORD( runends, i) &= ~(1ULL << (i % 64));
 			}
 
@@ -1741,216 +2007,447 @@ bool _onDiskMQF<bitsPerSlot>::remove(uint64_t hash, uint64_t count , bool lock, 
 /***********************************************************************
  * Code that uses the above to implement key-value-counter operations. *
  ***********************************************************************/
- void onDiskMQF::init( onDiskMQF *&qf, uint64_t nslots, uint64_t key_bits, uint64_t tag_bits,uint64_t fixed_counter_size ,const char * path){
+ void onDiskMQF::init( onDiskMQF *&qf, uint64_t nslots, uint64_t key_bits, uint64_t label_bits,uint64_t fixed_counter_size ,const char * path){
 	 uint64_t qbits=(uint64_t)log2((double)nslots);
 	 uint64_t tmpslotsSize=key_bits-qbits+fixed_counter_size;
 	 switch (tmpslotsSize) {
 		 case 1:
-		 		qf=new  onDiskMQF_Namespace::_onDiskMQF<1>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+		 		qf=new  onDiskMQF_Namespace::_onDiskMQF<1>(nslots,key_bits,label_bits,fixed_counter_size,path);
 	 			break;
 		 case 2:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<2>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<2>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 3:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<3>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<3>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 4:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<4>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<4>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 5:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<5>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<5>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 6:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<6>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<6>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 7:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<7>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<7>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 8:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<8>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<8>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 9:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<9>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<9>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 10:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<10>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<10>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 11:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<11>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<11>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 12:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<12>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<12>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 13:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<13>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<13>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 14:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<14>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<14>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 15:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<15>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<15>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 16:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<16>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<16>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 17:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<17>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<17>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 18:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<18>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<18>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 19:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<19>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<19>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 20:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<20>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<20>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 21:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<21>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<21>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 22:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<22>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<22>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 23:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<23>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<23>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 24:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<24>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<24>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 25:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<25>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<25>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 26:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<26>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<26>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 27:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<27>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<27>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 28:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<28>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<28>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 29:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<29>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<29>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 30:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<30>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<30>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 31:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<31>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<31>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 32:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<32>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<32>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 33:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<33>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<33>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 34:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<34>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<34>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 35:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<35>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<35>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 36:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<36>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<36>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 37:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<37>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<37>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 38:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<38>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<38>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 39:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<39>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<39>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 40:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<40>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<40>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 41:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<41>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<41>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 42:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<42>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<42>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 43:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<43>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<43>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 44:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<44>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<44>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 45:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<45>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<45>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 46:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<46>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<46>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 47:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<47>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<47>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 48:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<48>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<48>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 49:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<49>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<49>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 50:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<50>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<50>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 51:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<51>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<51>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 52:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<52>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<52>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 53:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<53>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<53>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 54:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<54>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<54>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 55:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<55>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<55>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 56:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<56>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<56>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 57:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<57>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<57>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 58:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<58>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<58>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 59:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<59>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<59>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 60:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<60>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<60>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 61:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<61>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<61>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 62:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<62>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<62>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 63:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<63>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<63>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 		 case 64:
-			 qf=new  onDiskMQF_Namespace::_onDiskMQF<64>(nslots,key_bits,tag_bits,fixed_counter_size,path);
+			 qf=new  onDiskMQF_Namespace::_onDiskMQF<64>(nslots,key_bits,label_bits,fixed_counter_size,path);
 			 break;
 
 	 }
 	 //qf->insert(100,1,false,false);
 	 //cout<<qf->count_key(100)<<endl;
  }
+ void onDiskMQF::load(onDiskMQF*& qf,const char *filename){
+	 FILE *fin;
+	 string metadataFile=string(filename)+".ondisk.metadata";
+	 fin = fopen(metadataFile.c_str(), "rb");
+	 if (fin == NULL) {
+		 perror("Error opening file for deserializing\n");
+		 exit(EXIT_FAILURE);
+	 }
+
+
+	 qfmetadata * metadata = (qfmetadata *)calloc(sizeof(qfmetadata), 1);
+
+	 fread(metadata, sizeof(qfmetadata), 1, fin);
+
+	 uint64_t bitsPerslot=metadata->key_remainder_bits+metadata->fixed_counter_size+metadata->label_bits;
+
+	 fclose(fin);
+	 free(metadata);
+     switch (bitsPerslot) {
+         case 1:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<1>(filename);
+             break;
+         case 2:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<2>(filename);
+             break;
+         case 3:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<3>(filename);
+             break;
+         case 4:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<4>(filename);
+             break;
+         case 5:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<5>(filename);
+             break;
+         case 6:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<6>(filename);
+             break;
+         case 7:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<7>(filename);
+             break;
+         case 8:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<8>(filename);
+             break;
+         case 9:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<9>(filename);
+             break;
+         case 10:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<10>(filename);
+             break;
+         case 11:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<11>(filename);
+             break;
+         case 12:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<12>(filename);
+             break;
+         case 13:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<13>(filename);
+             break;
+         case 14:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<14>(filename);
+             break;
+         case 15:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<15>(filename);
+             break;
+         case 16:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<16>(filename);
+             break;
+         case 17:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<17>(filename);
+             break;
+         case 18:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<18>(filename);
+             break;
+         case 19:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<19>(filename);
+             break;
+         case 20:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<20>(filename);
+             break;
+         case 21:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<21>(filename);
+             break;
+         case 22:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<22>(filename);
+             break;
+         case 23:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<23>(filename);
+             break;
+         case 24:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<24>(filename);
+             break;
+         case 25:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<25>(filename);
+             break;
+         case 26:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<26>(filename);
+             break;
+         case 27:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<27>(filename);
+             break;
+         case 28:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<28>(filename);
+             break;
+         case 29:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<29>(filename);
+             break;
+         case 30:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<30>(filename);
+             break;
+         case 31:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<31>(filename);
+             break;
+         case 32:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<32>(filename);
+             break;
+         case 33:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<33>(filename);
+             break;
+         case 34:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<34>(filename);
+             break;
+         case 35:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<35>(filename);
+             break;
+         case 36:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<36>(filename);
+             break;
+         case 37:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<37>(filename);
+             break;
+         case 38:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<38>(filename);
+             break;
+         case 39:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<39>(filename);
+             break;
+         case 40:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<40>(filename);
+             break;
+         case 41:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<41>(filename);
+             break;
+         case 42:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<42>(filename);
+             break;
+         case 43:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<43>(filename);
+             break;
+         case 44:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<44>(filename);
+             break;
+         case 45:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<45>(filename);
+             break;
+         case 46:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<46>(filename);
+             break;
+         case 47:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<47>(filename);
+             break;
+         case 48:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<48>(filename);
+             break;
+         case 49:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<49>(filename);
+             break;
+         case 50:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<50>(filename);
+             break;
+         case 51:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<51>(filename);
+             break;
+         case 52:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<52>(filename);
+             break;
+         case 53:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<53>(filename);
+             break;
+         case 54:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<54>(filename);
+             break;
+         case 55:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<55>(filename);
+             break;
+         case 56:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<56>(filename);
+             break;
+         case 57:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<57>(filename);
+             break;
+         case 58:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<58>(filename);
+             break;
+         case 59:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<59>(filename);
+             break;
+         case 60:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<60>(filename);
+             break;
+         case 61:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<61>(filename);
+             break;
+         case 62:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<62>(filename);
+             break;
+         case 63:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<63>(filename);
+             break;
+         case 64:
+             qf=new  onDiskMQF_Namespace::_onDiskMQF<64>(filename);
+             break;
+
+     }
+
+ }
+
+ void initializeDisk()
+ {
+ 	if(!isDiskInitialized) {
+		stxxl::config *cfg = stxxl::config::get_instance();
+		char filename[] = "/tmp/stxxl.XXXXXX"; // template for our file.
+		int fd = mkstemp(filename);
+		close(fd);
+		cfg->disk(0).path = filename;
+		cfg->disk(0).size = 10 * 1024;
+		isDiskInitialized=true;
+	}
+ }
 
 template<uint64_t bitsPerSlot>
-_onDiskMQF<bitsPerSlot>::_onDiskMQF( uint64_t nslots, uint64_t key_bits, uint64_t tag_bits,uint64_t fixed_counter_size ,const char * path)
+_onDiskMQF<bitsPerSlot>::_onDiskMQF( uint64_t nslots, uint64_t key_bits, uint64_t label_bits,uint64_t fixed_counter_size ,const char * path)
 {
+	initializeDisk();
+    using stxxl::file;
 	//qf=(QF*)calloc(sizeof(QF),1);
 	uint64_t num_slots, xnslots, nblocks;
 	uint64_t key_remainder_bits, bits_per_slot;
 	uint64_t size;
 
+	filename=path;
 
 	if(popcnt(nslots) != 1){
 		throw std::domain_error("nslots must be a power of 2");
@@ -1967,7 +2464,7 @@ _onDiskMQF<bitsPerSlot>::_onDiskMQF( uint64_t nslots, uint64_t key_bits, uint64_
 		nslots >>= 1;
 	}
 
-	bits_per_slot = key_remainder_bits+fixed_counter_size+tag_bits ;
+	bits_per_slot = key_remainder_bits+fixed_counter_size+label_bits ;
   if(bits_per_slot!=bitsPerSlot){
     cout<<"OnDisk MQF created wrong.bits per slot calculated form the parameters is not the same as the template parameter."<<endl;
   }
@@ -1983,7 +2480,7 @@ _onDiskMQF<bitsPerSlot>::_onDiskMQF( uint64_t nslots, uint64_t key_bits, uint64_
 	metadata->xnslots = metadata->nslots +
 		10*sqrt((double)metadata->nslots);
 	metadata->key_bits = key_bits;
-	metadata->tag_bits = tag_bits;
+	metadata->label_bits = label_bits;
 	metadata->fixed_counter_size = fixed_counter_size;
 	metadata->key_remainder_bits = key_remainder_bits;
 	metadata->bits_per_slot = bits_per_slot;
@@ -1995,10 +2492,10 @@ _onDiskMQF<bitsPerSlot>::_onDiskMQF( uint64_t nslots, uint64_t key_bits, uint64_
 	metadata->nelts = 0;
 	metadata->ndistinct_elts = 0;
 	metadata->noccupied_slots = 0;
-	metadata->maximum_occupied_slots=(uint64_t)((double)metadata->xnslots *0.95);
+	metadata->maximum_occupied_slots=(uint64_t)((double)metadata->xnslots *0.85);
 	metadata->num_locks = (metadata->xnslots/NUM_SLOTS_TO_LOCK)+2;
 	metadata->maximum_count = 0;
-	metadata->tags_map=NULL;
+	metadata->labels_map=NULL;
 
 
 
@@ -2008,9 +2505,14 @@ _onDiskMQF<bitsPerSlot>::_onDiskMQF( uint64_t nslots, uint64_t key_bits, uint64_
 	mem->general_lock = 0;
 	mem->locks = (volatile int *)calloc(metadata->num_locks,
 																					sizeof(volatile int));
+    file::unlink(path); // delete output file
+	OutputFile=new stxxl::syscall_file(path, file::RDWR | file::CREAT | file::DIRECT );
+	blocks=new stxxlVector (OutputFile, metadata->nblocks,stxxlBufferSize/16);
 
 
-	blocks=stxxl::vector<onDisk_qfblock<bitsPerSlot> >(metadata->nblocks,stxxlBufferSize/16);
+
+
+
 	// for(uint64_t i=0;i<metadata->nblocks;i++)
 	// 	blocks[i]=onDisk_qfblock<bitsPerSlot>();
   //
@@ -2067,49 +2569,50 @@ _onDiskMQF<bitsPerSlot>::_onDiskMQF( uint64_t nslots, uint64_t key_bits, uint64_
 
 /* The caller should call onDiskMQF_init on the dest QF before calling this function.
  */
-template<uint64_t bitsPerSlot>
-void _onDiskMQF<bitsPerSlot>::copy(onDiskMQF *dest)
-{
-	// _onDiskMQF<bitsPerSlot>* qf=this;
-	throw std::logic_error("not implemented yet");
-	// memcpy(dest->mem, src->mem, sizeof(qfmem));
-	// memcpy(dest->metadata, src->metadata, sizeof(qfmetadata));
-	// //memcpy(dest->blocks, src->blocks, src->metadata->size);
-  //
-	// if(src->metadata->tags_map!=NULL){
-	// 	dest->metadata->tags_map=
-	// 	new std::map<uint64_t, std::vector<int> >(*src->metadata->tags_map);
-	// }
-}
+ template<uint64_t bitsPerSlot>
+ void _onDiskMQF<bitsPerSlot>::copy(onDiskMQF *dest)
+ {
+     migrate(dest);
+    // ( onDiskMQF *&qf, uint64_t nslots, uint64_t key_bits, uint64_t label_bits,uint64_t fixed_counter_size ,const char * path)
+ 	//_onDiskMQF<bitsPerSlot>* src=this;
+   // dest = new _onDiskMQF(uint64_t nslots, uint64_t key_bits, uint64_t label_bits,uint64_t fixed_counter_size,const char * path);
+  // init(dest, src->metadata->nslots, src->metadata->key_bits, src->metadata->label_bits, src->metadata->fixed_counter_size, "");
+   // throw std::logic_error("not implemented yet");
+ //	memcpy(dest->mem, src->mem, sizeof(qfmem));
+ //	memcpy(dest->metadata, src->metadata, sizeof(qfmetadata));
+ 	// memcpy(dest->blocks, src->blocks, src->metadata->size);
+
+// 	if(src->metadata->labels_map!=NULL){
+// 		dest->metadata->labels_map=
+// 		new std::map<uint64_t, std::vector<int> >(*src->metadata->labels_map);
+// 	}
+ }
+
 
 /* free up the memory if the QF is in memory.
  * else unmap the mapped memory from pagecache.
  *
  * It does not delete the file on disk for on-disk QF.
  */
-template<uint64_t bitsPerSlot>
-_onDiskMQF<bitsPerSlot>::~_onDiskMQF()
-{
-	_onDiskMQF<bitsPerSlot>* qf=this;
-	//assert(qf->blocks != NULL);
-
-	qf->metadata->noccupied_slots=0;
-	if(qf->metadata->tags_map!=NULL){
-		delete qf->metadata->tags_map;
-		qf->metadata->tags_map=NULL;
-	}
-	if (qf->metadata->mem) {
-		free(qf->mem);
-		free(qf->metadata);
-		qf->blocks.clear();
-		//free(qf->blocks);
-	} else {
-	//msync(qf->metadata, qf->metadata->size + sizeof(qfmetadata),MS_SYNC);
-//	munmap(qf->metadata, qf->metadata->size + sizeof(qfmetadata));
-	//close(qf->mem->fd);
-	}
-
-}
+//template<uint64_t bitsPerSlot>
+//_onDiskMQF<bitsPerSlot>::~_onDiskMQF()
+//{
+//	_onDiskMQF<bitsPerSlot>* qf=this;
+//	//assert(qf->blocks != NULL);
+//
+//	qf->metadata->noccupied_slots=0;
+//	if(qf->metadata->labels_map!=NULL){
+//		delete qf->metadata->labels_map;
+//		qf->metadata->labels_map=NULL;
+//	}
+//	free(qf->mem);
+//	free(qf->metadata);
+//	qf->blocks.flush();
+////	qf->blocks=stxxlVector();
+//	cout<<"it should be destructred"<<endl;
+//	//qf->blocks.clear();
+//
+//}
 
 // template<uint64_t bitsPerSlot>
 // void _onDiskMQF<bitsPerSlot>::close()
@@ -2160,9 +2663,9 @@ _onDiskMQF<bitsPerSlot>::~_onDiskMQF()
 		 qf->mem->locks = (volatile int *)calloc(qf->metadata->num_locks,
 			 sizeof(volatile int));
 
-	string tagsMapOutName=string(path)+".tags_map";
-	if(file_exists(tagsMapOutName)){
-		qf->metadata->tags_map=load_tags_map(tagsMapOutName.c_str());
+	string labelsMapOutName=string(path)+".labels_map";
+	if(MQF::file_exists(labelsMapOutName)){
+		qf->metadata->labels_map=MQF::load_labels_map(labelsMapOutName.c_str());
 	}
 
 }
@@ -2176,8 +2679,8 @@ void _onDiskMQF<bitsPerSlot>::reset()
 	qf->metadata->nelts = 0;
 	qf->metadata->ndistinct_elts = 0;
 	qf->metadata->noccupied_slots = 0;
-	if(qf->metadata->tags_map!=NULL)
-		qf->metadata->tags_map->clear();
+	if(qf->metadata->labels_map!=NULL)
+		qf->metadata->labels_map->clear();
 
 	//memset(qf->blocks, 0, qf->metadata->nblocks*(sizeof(qfblock) + SLOTS_PER_BLOCK *
 	//																	 qf->metadata->bits_per_slot / 8));
@@ -2185,12 +2688,13 @@ void _onDiskMQF<bitsPerSlot>::reset()
 }
 
 template<uint64_t bitsPerSlot>
-void _onDiskMQF<bitsPerSlot>::serialize(const char *filename)
+void _onDiskMQF<bitsPerSlot>::serialize()
 {
-	throw std::logic_error("not implemented yet");
+
 	_onDiskMQF<bitsPerSlot>* qf=this;
 	FILE *fout;
-	fout = fopen(filename, "wb+");
+	string metadataFile=string(filename)+".ondisk.metadata";
+	fout = fopen(metadataFile.c_str(), "wb+");
 	if (fout == NULL) {
 		perror("Error opening file for serializing\n");
 		exit(EXIT_FAILURE);
@@ -2199,54 +2703,65 @@ void _onDiskMQF<bitsPerSlot>::serialize(const char *filename)
 	/* we don't serialize the locks */
 	//fwrite(qf->blocks, qf->metadata->size, 1, fout);
 	fclose(fout);
-
-	if(qf->metadata->tags_map!=NULL)
+    blocks->flush();
+	if(qf->metadata->labels_map!=NULL)
 	{
-		string tagsMapOutName=string(filename)+".tags_map";
-		save_tags_map(qf->metadata->tags_map,tagsMapOutName.c_str());
+		string labelsMapOutName=string(filename)+".labels_map";
+		MQF::save_labels_map(qf->metadata->labels_map,labelsMapOutName.c_str());
 	}
 }
 
 
 template<uint64_t bitsPerSlot>
-void _onDiskMQF<bitsPerSlot>::deserialize(const char *filename)
+_onDiskMQF<bitsPerSlot>::_onDiskMQF(const char *filename)
 {
-	throw std::logic_error("not implemented yet");
-	_onDiskMQF<bitsPerSlot>* qf=this;
+	using stxxl::file;
+	initializeDisk();
+
 	FILE *fin;
-	fin = fopen(filename, "rb");
+	string metadataFile=string(filename)+".ondisk.metadata";
+	fin = fopen(metadataFile.c_str(), "rb");
 	if (fin == NULL) {
 		perror("Error opening file for deserializing\n");
 		exit(EXIT_FAILURE);
 	}
 
-	qf->mem = (qfmem *)calloc(sizeof(qfmem), 1);
-	qf->metadata = (qfmetadata *)calloc(sizeof(qfmetadata), 1);
+	mem = (qfmem *)calloc(sizeof(qfmem), 1);
+	metadata = (qfmetadata *)calloc(sizeof(qfmetadata), 1);
 
-	fread(qf->metadata, sizeof(qfmetadata), 1, fin);
+	fread(metadata, sizeof(qfmetadata), 1, fin);
 
 	/* initlialize the locks in the QF */
-	qf->metadata->num_locks = (qf->metadata->xnslots/NUM_SLOTS_TO_LOCK)+2;
-	qf->mem->metadata_lock = 0;
+	metadata->num_locks = (metadata->xnslots/NUM_SLOTS_TO_LOCK)+2;
+	mem->metadata_lock = 0;
 	/* initialize all the locks to 0 */
-	qf->mem->locks = (volatile int *)calloc(qf->metadata->num_locks, sizeof(volatile int));
+	mem->locks = (volatile int *)calloc(metadata->num_locks, sizeof(volatile int));
+	fclose(fin);
+
+	uint64_t  size = metadata->nblocks * (sizeof(qfblock) + (8 * bitsPerSlot )) ;
+	stxxlBufferSize= (uint64_t)((double)(size)*0.2/(1024.0*1024.0));
+	stxxlBufferSize=max(stxxlBufferSize,(uint64_t)16);
+
+	OutputFile= new stxxl::syscall_file(filename, file::RDWR  | file::DIRECT );
+	blocks=new stxxlVector (OutputFile, metadata->nblocks,stxxlBufferSize/16);
+    //blocks=stxxlVector (&OutputFile);
 
 	//qf->blocks = (qfblock *)calloc(qf->metadata->size, 1);
 	//fread(qf->blocks, qf->metadata->size, 1, fin);
-	fclose(fin);
 
-	string tagsMapOutName=string(filename)+".tags_map";
-	if(file_exists(tagsMapOutName)){
-		qf->metadata->tags_map=load_tags_map(tagsMapOutName.c_str());
-	}
+
+//	string labelsMapOutName=string(filename)+".labels_map";
+//	if(file_exists(labelsMapOutName)){
+//		qf->metadata->labels_map=load_labels_map(labelsMapOutName.c_str());
+//	}
 
 
 }
 template<uint64_t bitsPerSlot>
-uint64_t _onDiskMQF<bitsPerSlot>::add_tag(uint64_t key, uint64_t tag, bool lock, bool spin)
+uint64_t _onDiskMQF<bitsPerSlot>::add_label(uint64_t key, uint64_t label, bool lock, bool spin)
 {
 	_onDiskMQF<bitsPerSlot>* qf=this;
-	if(qf->metadata->tag_bits==0){
+	if(qf->metadata->label_bits==0){
 		return 0;
 	}
 	__uint128_t hash = key;
@@ -2279,7 +2794,7 @@ uint64_t _onDiskMQF<bitsPerSlot>::add_tag(uint64_t key, uint64_t tag, bool lock,
 				return 0;
 			}
 
-			set_tag(runstart_index,tag);
+			set_label(runstart_index,label);
 			if (lock) {
 				unlock( runstart_index, true);
 			}
@@ -2295,10 +2810,10 @@ uint64_t _onDiskMQF<bitsPerSlot>::add_tag(uint64_t key, uint64_t tag, bool lock,
 }
 
 template<uint64_t bitsPerSlot>
-uint64_t _onDiskMQF<bitsPerSlot>::remove_tag(uint64_t key ,bool lock, bool spin)
+uint64_t _onDiskMQF<bitsPerSlot>::remove_label(uint64_t key ,bool lock, bool spin)
 {
 _onDiskMQF<bitsPerSlot>* qf=this;
-	if(qf->metadata->tag_bits==0){
+	if(qf->metadata->label_bits==0){
 		return 0;
 	}
 
@@ -2306,7 +2821,7 @@ _onDiskMQF<bitsPerSlot>* qf=this;
 	uint64_t hash_remainder   = hash & BITMASK(qf->metadata->key_remainder_bits);
 	uint64_t hash_bucket_index = hash >> qf->metadata->key_remainder_bits;
 	if(hash_bucket_index > qf->metadata->xnslots){
-			throw std::out_of_range("onDiskMQF_remove_tag is called with hash index out of range");
+			throw std::out_of_range("onDiskMQF_remove_label is called with hash index out of range");
 		}
 
 	if (!is_occupied( hash_bucket_index)){
@@ -2331,7 +2846,7 @@ _onDiskMQF<bitsPerSlot>* qf=this;
 				if (!spin_lock( runstart_index, spin, false))
 					return false;
 				}
-			set_tag(runstart_index,0);
+			set_label(runstart_index,0);
 			if (lock)
 				unlock( runstart_index, true);
 			return 1;
@@ -2343,17 +2858,17 @@ _onDiskMQF<bitsPerSlot>* qf=this;
 	return 0;
 }
 template<uint64_t bitsPerSlot>
-uint64_t _onDiskMQF<bitsPerSlot>::get_tag(uint64_t key)
+uint64_t _onDiskMQF<bitsPerSlot>::get_label(uint64_t key)
 {
 	_onDiskMQF<bitsPerSlot>* qf=this;
-	if(qf->metadata->tag_bits==0){
+	if(qf->metadata->label_bits==0){
 		return 0;
 	}
 	__uint128_t hash = key;
 	uint64_t hash_remainder   = hash & BITMASK(qf->metadata->key_remainder_bits);
 	uint64_t hash_bucket_index = hash >> qf->metadata->key_remainder_bits;
 	if(hash_bucket_index > qf->metadata->xnslots){
-			throw std::out_of_range("onDiskMQF_get_tag is called with hash index out of range");
+			throw std::out_of_range("onDiskMQF_get_label is called with hash index out of range");
 		}
 	if (!is_occupied( hash_bucket_index))
 		return 0;
@@ -2371,7 +2886,7 @@ uint64_t _onDiskMQF<bitsPerSlot>::get_tag(uint64_t key)
 		current_end = decode_counter( runstart_index, &current_remainder,
 																 &current_count);
 		if (current_remainder == hash_remainder){
-			return _get_tag(runstart_index);
+			return _get_label(runstart_index);
 		}
 		runstart_index = current_end + 1;
 	} while (!is_runend( current_end));
@@ -2383,12 +2898,11 @@ template<uint64_t bitsPerSlot>
 bool _onDiskMQF<bitsPerSlot>::insert(uint64_t key, uint64_t count, bool
 							 lock, bool spin)
 {
-	_onDiskMQF<bitsPerSlot>* qf=this;
 	if(count==0)
 	{
 		return true;
 	}
-	/*uint64_t hash = (key << qf->metadata->tag_bits) | (value & BITMASK(qf->metadata->tag_bits));*/
+	/*uint64_t hash = (key << qf->metadata->label_bits) | (value & BITMASK(qf->metadata->label_bits));*/
 	if (count == 1)
 	 return insert1( key, lock, spin);
 	else
@@ -2427,14 +2941,55 @@ uint64_t _onDiskMQF<bitsPerSlot>::count_key(uint64_t key)
 	return 0;
 }
 
+template<uint64_t bitsPerSlot>
+bool _onDiskMQF<bitsPerSlot>::findIterator(onDiskMQFIterator  *qfi, uint64_t key)
+{
+	_onDiskMQF<bitsPerSlot>* qf=this;
+		 __uint128_t hash = key;
+		 uint64_t hash_remainder   = hash & BITMASK(qf->metadata->key_remainder_bits);
+		 int64_t hash_bucket_index = hash >> qf->metadata->key_remainder_bits;
 
+		 if (!is_occupied( hash_bucket_index))
+			 return 0;
 
+		 int64_t runstart_index = hash_bucket_index == 0 ? 0 : run_end(
+																	   hash_bucket_index-1)
+															   + 1;
+		 if (runstart_index < hash_bucket_index)
+			 runstart_index = hash_bucket_index;
+
+		 /* printf("MC RUNSTART: %02lx RUNEND: %02lx\n", runstart_index, runend_index); */
+
+		 uint64_t current_remainder, current_count, current_end;
+		 do {
+			 current_end = decode_counter(runstart_index, &current_remainder,
+										  &current_count);
+			 if (current_remainder == hash_remainder){
+				 // qf_iterator(qf,qfi,runstart_index/64);
+				 // uint64_t ckey,count,value;
+				 // qfi_get(qfi,&ckey,&value,&count);
+				 // while(ckey!=key){
+				 // 	qfi_next(qfi);
+				 // 	qfi_get(qfi,&ckey,&value,&count);
+				 // }
+				 //	uint64_t position=runstart_index;
+				 qfi->qf = qf;
+				 qfi->num_clusters = 0;
+				 qfi->run = hash_bucket_index;
+				 qfi->current=runstart_index;
+				 return true;
+			 }
+
+			 runstart_index = current_end + 1;
+		 } while (!is_runend(current_end));
+		 return false;
+	 }
 
 /* initialize the iterator at the run corresponding
  * to the position index
  */
 template<uint64_t bitsPerSlot>
-bool _onDiskMQF<bitsPerSlot>::getIterator(onDiskMQFIterator<bitsPerSlot> *qfi, uint64_t position)
+bool _onDiskMQF<bitsPerSlot>::getIterator(onDiskMQFIterator *qfi, uint64_t position)
 {
 	_onDiskMQF<bitsPerSlot>* qf=this;
 	if(position > qf->metadata->xnslots){
@@ -2455,7 +3010,7 @@ bool _onDiskMQF<bitsPerSlot>::getIterator(onDiskMQFIterator<bitsPerSlot> *qfi, u
 	qfi->qf = qf;
 	qfi->num_clusters = 0;
 	qfi->run = position;
-	qfi->current = position == 0 ? 0 : run_end(qfi->qf, position-1) + 1;
+	qfi->current = position == 0 ? 0 : run_end( position-1) + 1;
 	if (qfi->current < position)
 		qfi->current = position;
 
@@ -2467,56 +3022,57 @@ bool _onDiskMQF<bitsPerSlot>::getIterator(onDiskMQFIterator<bitsPerSlot> *qfi, u
 }
 
 template<uint64_t bitsPerSlot>
-int onDiskMQFIterator<bitsPerSlot>::get(uint64_t *key, uint64_t *value, uint64_t *count)
+bool _onDiskMQF<bitsPerSlot>::getForIterator(onDiskMQFIterator* qfi,uint64_t *key, uint64_t *value, uint64_t *count)
 {
-	onDiskMQFIterator<bitsPerSlot> *qfi=this;
-	if(qfi->current > qfi->qf->metadata->xnslots){
+	if(qfi->current > metadata->xnslots){
 		throw std::out_of_range("onDiskMQFIterator_get is called with hash index out of range");
 	}
 	uint64_t current_remainder, current_count;
-	decode_counter(qfi->qf, qfi->current, &current_remainder, &current_count);
-	*key = (qfi->run << qfi->qf->metadata->key_remainder_bits) | current_remainder;
-	*value = _get_tag(qfi->qf,qfi->current);   // for now we are not using value
+	decode_counter(qfi->current, &current_remainder, &current_count);
+	*key = (qfi->run << metadata->key_remainder_bits) | current_remainder;
+	*value = _get_label(qfi->current);   // for now we are not using value
 	*count = current_count;
+	return true;
+}
 
-	qfi->qf->metadata->ndistinct_elts++;
-	qfi->qf->metadata->nelts += current_count;
-
-	/*qfi->current = end_index;*/ 		//get should not change the current index
-																		//of the iterator
-	return 0;
+int onDiskMQFIterator::get(uint64_t *key, uint64_t *value, uint64_t *count)
+{
+	return qf->getForIterator(this,key,value,count);
+}
+int onDiskMQFIterator::next()
+{
+	return qf->nextForIterator(this);
 }
 template<uint64_t bitsPerSlot>
-int onDiskMQFIterator<bitsPerSlot>::next()
+int _onDiskMQF<bitsPerSlot>::nextForIterator(onDiskMQFIterator *qfi)
 {
-	onDiskMQFIterator<bitsPerSlot> *qfi=this;
-	if (onDiskMQFIterator_end(qfi))
+	if (qfi->end())
 		return 1;
 	else {
 		/* move to the end of the current counter*/
 		uint64_t current_remainder, current_count;
-		qfi->current = decode_counter(qfi->qf, qfi->current, &current_remainder,
+		qfi->current = decode_counter(qfi->current, &current_remainder,
 																	&current_count);
 
-		if (!is_runend(qfi->qf, qfi->current)) {
+		if (!is_runend( qfi->current)) {
 			qfi->current++;
 
-			if (qfi->current > qfi->qf->metadata->xnslots)
+			if (qfi->current > metadata->xnslots)
 				return 1;
 			return 0;
 		}
 		else {
 
 			uint64_t block_index = qfi->run / SLOTS_PER_BLOCK;
-			uint64_t rank = bitrank(qfi->qf->get_block(block_index)->occupieds[0],
+			uint64_t rank = bitrank(get_block(block_index)->occupieds[0],
 															qfi->run % SLOTS_PER_BLOCK);
-			uint64_t next_run = bitselect(qfi->qf->get_block(block_index)->occupieds[0],
+			uint64_t next_run = bitselect(get_block(block_index)->occupieds[0],
 																		rank);
 			if (next_run == 64) {
 				rank = 0;
 				while (next_run == 64 && block_index < qfi->qf->metadata->nblocks) {
 					block_index++;
-					next_run = bitselect(qfi->qf->get_block(block_index)->occupieds[0],
+					next_run = bitselect(get_block(block_index)->occupieds[0],
 															 rank);
 				}
 			}
@@ -2535,10 +3091,10 @@ int onDiskMQFIterator<bitsPerSlot>::next()
 	}
 }
 
-template<uint64_t bitsPerSlot>
-inline int onDiskMQFIterator<bitsPerSlot>::end()
+
+int onDiskMQFIterator::end()
 {
-	onDiskMQFIterator<bitsPerSlot> *qfi=this;
+	onDiskMQFIterator *qfi=this;
 	if (qfi->current >= qfi->qf->metadata->xnslots /*&& is_runend(qfi->qf, qfi->current)*/)
 		return 1;
 	else
@@ -2546,54 +3102,54 @@ inline int onDiskMQFIterator<bitsPerSlot>::end()
 }
 
 
-void unionFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
-					   uint64_t  key_b, uint64_t  tag_b,uint64_t  count_b,
-					   uint64_t *key_c, uint64_t *tag_c,uint64_t *count_c)
+void unionFn(uint64_t  key_a, uint64_t  label_a,uint64_t  count_a,
+					   uint64_t  key_b, uint64_t  label_b,uint64_t  count_b,
+					   uint64_t *key_c, uint64_t *label_c,uint64_t *count_c)
 {
 		if(count_a==0){
 			*key_c=key_b;
-			*tag_c=tag_a;
+			*label_c=label_a;
 			*count_c=count_b;
 		}
 		else if(count_b==0){
 			*key_c=key_a;
-			*tag_c=tag_a;
+			*label_c=label_a;
 			*count_c=count_a;
 		}
 		else{
 			*key_c=key_a;
-			*tag_c=tag_a;
+			*label_c=label_a;
 			*count_c=count_a+count_b;
 		}
 
 }
-void intersectFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
-					   uint64_t  key_b, uint64_t  tag_b,uint64_t  count_b,
-					   uint64_t *key_c, uint64_t *tag_c,uint64_t *count_c)
+void intersectFn(uint64_t  key_a, uint64_t  label_a,uint64_t  count_a,
+					   uint64_t  key_b, uint64_t  label_b,uint64_t  count_b,
+					   uint64_t *key_c, uint64_t *label_c,uint64_t *count_c)
 {
 	*key_c=0;
-	*tag_c=0;
+	*label_c=0;
 	*count_c=0;
 	if(count_a!=0 && count_b!=0){
 			*key_c=key_a;
-			*tag_c=tag_a;
+			*label_c=label_a;
 			*count_c=std::min(count_a,count_b);
 	}
 
 }
 
-void subtractFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
-					   uint64_t  key_b, uint64_t  tag_b,uint64_t  count_b,
-					   uint64_t *key_c, uint64_t *tag_c,uint64_t *count_c)
+void subtractFn(uint64_t  key_a, uint64_t  label_a,uint64_t  count_a,
+					   uint64_t  key_b, uint64_t  label_b,uint64_t  count_b,
+					   uint64_t *key_c, uint64_t *label_c,uint64_t *count_c)
 {
 		if(count_b==0){
 			*key_c=key_a;
-			*tag_c=tag_a;
+			*label_c=label_a;
 			*count_c=count_a;
 		}
 		else{
 			*key_c=key_a;
-			*tag_c=tag_a;
+			*label_c=label_a;
 			*count_c=count_a<count_b ? 0:count_a-count_b;
 		}
 
@@ -2612,9 +3168,9 @@ void subtractFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
  * increment either ia or ib, whichever is minimum.
  */
 // void _onDiskMQF_merge(onDiskMQF *qfa, onDiskMQF *qfb, onDiskMQF *qfc,
-// 	void(*mergeFn)(uint64_t   keya, uint64_t  tag_a,uint64_t  count_a,
-// 						  	 uint64_t   keyb, uint64_t  tag_b,uint64_t  count_b,
-// 							   uint64_t*  keyc, uint64_t* tag_c,uint64_t* count_c
+// 	void(*mergeFn)(uint64_t   keya, uint64_t  label_a,uint64_t  count_a,
+// 						  	 uint64_t   keyb, uint64_t  label_b,uint64_t  count_b,
+// 							   uint64_t*  keyc, uint64_t* label_c,uint64_t* count_c
 // 							 ))
 // {
 // 	onDiskMQFIterator qfia, qfib;
@@ -2626,32 +3182,32 @@ void subtractFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
 // 	onDiskMQF_iterator(qfa, &qfia, 0);
 // 	onDiskMQF_iterator(qfb, &qfib, 0);
 //
-// 	uint64_t keya, taga, counta, keyb, tagb, countb;
-// 	uint64_t keyc,tagc, countc;
-// 	onDiskMQFIterator_get(&qfia, &keya, &taga, &counta);
-// 	onDiskMQFIterator_get(&qfib, &keyb, &tagb, &countb);
+// 	uint64_t keya, labela, counta, keyb, labelb, countb;
+// 	uint64_t keyc,labelc, countc;
+// 	onDiskMQFIterator_get(&qfia, &keya, &labela, &counta);
+// 	onDiskMQFIterator_get(&qfib, &keyb, &labelb, &countb);
 //
 // 	do {
 // 		if (keya < keyb) {
-// 			mergeFn(keya,taga,counta,0,0,0,&keyc,&tagc,&countc);
+// 			mergeFn(keya,labela,counta,0,0,0,&keyc,&labelc,&countc);
 // 			onDiskMQFIterator_next(&qfia);
-// 			onDiskMQFIterator_get(&qfia, &keya, &taga, &counta);
+// 			onDiskMQFIterator_get(&qfia, &keya, &labela, &counta);
 // 		}
 // 		else if(keya > keyb) {
-// 			mergeFn(0,0,0,keyb,tagb,countb,&keyc,&tagc,&countc);
+// 			mergeFn(0,0,0,keyb,labelb,countb,&keyc,&labelc,&countc);
 // 			onDiskMQFIterator_next(&qfib);
-// 			onDiskMQFIterator_get(&qfib, &keyb, &tagb, &countb);
+// 			onDiskMQFIterator_get(&qfib, &keyb, &labelb, &countb);
 // 		}
 // 		else{
-// 			mergeFn(keya,taga,counta,keyb,tagb,countb,&keyc,&tagc,&countc);
+// 			mergeFn(keya,labela,counta,keyb,labelb,countb,&keyc,&labelc,&countc);
 // 			onDiskMQFIterator_next(&qfia);
 // 			onDiskMQFIterator_next(&qfib);
-// 			onDiskMQFIterator_get(&qfia, &keya, &taga, &counta);
-// 			onDiskMQFIterator_get(&qfib, &keyb, &tagb, &countb);
+// 			onDiskMQFIterator_get(&qfia, &keya, &labela, &counta);
+// 			onDiskMQFIterator_get(&qfib, &keyb, &labelb, &countb);
 // 		}
 // 		if(countc!=0){
 // 			onDiskMQF_insert(qfc, keyc, countc, true, true);
-// 			onDiskMQF_add_tag(qfc,keya,tagc);
+// 			onDiskMQF_add_label(qfc,keya,labelc);
 // 		}
 //
 // 	} while(!onDiskMQFIterator_end(&qfia) && !onDiskMQFIterator_end(&qfib));
@@ -2659,22 +3215,22 @@ void subtractFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
 // 	if (!onDiskMQFIterator_end(&qfia)) {
 //
 // 		do {
-// 			onDiskMQFIterator_get(&qfia, &keya, &taga, &counta);
-// 			mergeFn(keya,taga,counta,0,0,0,&keyc,&tagc,&countc);
+// 			onDiskMQFIterator_get(&qfia, &keya, &labela, &counta);
+// 			mergeFn(keya,labela,counta,0,0,0,&keyc,&labelc,&countc);
 // 			if(countc!=0){
 // 				onDiskMQF_insert(qfc, keyc, countc, true, true);
-// 				onDiskMQF_add_tag(qfc,keyc,tagc);
+// 				onDiskMQF_add_label(qfc,keyc,labelc);
 // 			}
 // 		} while(!onDiskMQFIterator_next(&qfia));
 // 	}
 //
 // 	if (!onDiskMQFIterator_end(&qfib)) {
 // 		do {
-// 			onDiskMQFIterator_get(&qfib, &keyb, &tagb, &countb);
-// 			mergeFn(0,0,0,keyb,tagb,countb,&keyc,&tagc,&countc);
+// 			onDiskMQFIterator_get(&qfib, &keyb, &labelb, &countb);
+// 			mergeFn(0,0,0,keyb,labelb,countb,&keyc,&labelc,&countc);
 // 			if(countc!=0){
 // 				onDiskMQF_insert(qfc, keyc, countc, true, true);
-// 				onDiskMQF_add_tag(qfc,keyc,tagc);
+// 				onDiskMQF_add_label(qfc,keyc,labelc);
 // 			}
 // 		} while(!onDiskMQFIterator_next(&qfib));
 // 	}
@@ -2733,11 +3289,11 @@ void subtractFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
 //
 //
 //
-// std::map<std::string, uint64_t> Tags_map;
+// std::map<std::string, uint64_t> Labels_map;
 // uint64_t last_index=0;
-// void union_multi_Fn(uint64_t   key_arr[], uint64_t  tag_arr[],uint64_t  count_arr[]
+// void union_multi_Fn(uint64_t   key_arr[], uint64_t  label_arr[],uint64_t  count_arr[]
 // 	,std::map<uint64_t, std::vector<int> > ** inverted_indexes,int nqf,
-// 							 uint64_t*  key_c, uint64_t* tag_c,uint64_t* count_c)
+// 							 uint64_t*  key_c, uint64_t* label_c,uint64_t* count_c)
 // {
 //
 // 	*count_c=0;
@@ -2747,7 +3303,7 @@ void subtractFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
 // 		if(count_arr[i]!=0)
 // 		{
 // 			*key_c=key_arr[i];
-// 			*tag_c=tag_arr[i];
+// 			*label_c=label_arr[i];
 // 			*count_c+=count_arr[i];
 // 		}
 // 	}
@@ -2755,9 +3311,9 @@ void subtractFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
 // }
 //
 // void _onDiskMQF_multi_merge(onDiskMQF *onDiskMQF_arr[],int nqf, onDiskMQF *qfr,
-// 	void(*mergeFn)(uint64_t   key_arr[], uint64_t  tag_arr[],uint64_t  count_arr[],
+// 	void(*mergeFn)(uint64_t   key_arr[], uint64_t  label_arr[],uint64_t  count_arr[],
 // 								std::map<uint64_t, std::vector<int> > ** inverted_indexes,int nqf,
-// 							   uint64_t*  keyc, uint64_t* tag_c,uint64_t* count_c
+// 							   uint64_t*  keyc, uint64_t* label_c,uint64_t* count_c
 // 							 ))
 // {
 // 	int i;
@@ -2773,20 +3329,20 @@ void subtractFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
 //
 // 	uint64_t smallest_key=UINT64_MAX,second_smallest_key;
 // 	uint64_t keys[nqf];
-// 	uint64_t tags[nqf];
+// 	uint64_t labels[nqf];
 // 	uint64_t counts[nqf];
 // 	std::map<uint64_t, std::vector<int> > ** inverted_indexes=new std::map<uint64_t, std::vector<int> >*[nqf];
 //
 // 	for (i=0; i<nqf; i++) {
 // 		onDiskMQFIterator_arr[i]=new onDiskMQFIterator();
 // 		onDiskMQF_iterator(onDiskMQF_arr[i], onDiskMQFIterator_arr[i], 0);
-// 		onDiskMQFIterator_get(onDiskMQFIterator_arr[i], &keys[i], &tags[i], &counts[i]);
+// 		onDiskMQFIterator_get(onDiskMQFIterator_arr[i], &keys[i], &labels[i], &counts[i]);
 // 		smallest_key=std::min(keys[i],smallest_key);
-// 		inverted_indexes[i]=onDiskMQF_arr[i]->metadata->tags_map;
+// 		inverted_indexes[i]=onDiskMQF_arr[i]->metadata->labels_map;
 // 	}
 //
 // 	uint64_t keys_m[nqf];
-// 	uint64_t tags_m[nqf];
+// 	uint64_t labels_m[nqf];
 // 	uint64_t counts_m[nqf];
 //
 //
@@ -2800,18 +3356,18 @@ void subtractFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
 // 		{
 // 			keys_m[i]=0;
 // 			counts_m[i]=0;
-// 			tags_m[i]=0;
+// 			labels_m[i]=0;
 //
 // 			//printf(" key = %llu\n",keys[i]);
 // 			if(keys[i]==smallest_key){
 // 				keys_m[i]=keys[i];
 // 				counts_m[i]=counts[i];
-// 				tags_m[i]=tags[i];
+// 				labels_m[i]=labels[i];
 // 				onDiskMQFIterator_next(onDiskMQFIterator_arr[i]);
 // 				if(!onDiskMQFIterator_end(onDiskMQFIterator_arr[i]))
 // 				{
 // 					finish=false;
-// 					onDiskMQFIterator_get(onDiskMQFIterator_arr[i], &keys[i], &tags[i], &counts[i]);
+// 					onDiskMQFIterator_get(onDiskMQFIterator_arr[i], &keys[i], &labels[i], &counts[i]);
 // 				}else{
 // 					keys[i]=UINT64_MAX;
 // 				}
@@ -2826,12 +3382,12 @@ void subtractFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
 // 			}
 // 		}
 // 		//printf("second_smallest_key=%llu finish=%d\n",second_smallest_key,finish);
-// 		uint64_t keyc,tagc, countc;
-// 		mergeFn(keys_m,tags_m,counts_m,inverted_indexes,nqf,&keyc,&tagc,&countc);
+// 		uint64_t keyc,labelc, countc;
+// 		mergeFn(keys_m,labels_m,counts_m,inverted_indexes,nqf,&keyc,&labelc,&countc);
 //
 // 		if(countc!=0){
 // 			onDiskMQF_insert(qfr, keyc, countc, true, true);
-// 			onDiskMQF_add_tag(qfr,keyc,tagc);
+// 			onDiskMQF_add_label(qfr,keyc,labelc);
 // 		}
 // 		smallest_key=second_smallest_key;
 // 	}
@@ -2854,9 +3410,9 @@ void subtractFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
 //
 // }
 //
-// void inverted_union_multi_Fn(uint64_t   key_arr[], uint64_t  tag_arr[],uint64_t  count_arr[],
+// void inverted_union_multi_Fn(uint64_t   key_arr[], uint64_t  label_arr[],uint64_t  count_arr[],
 // 	std::map<uint64_t, std::vector<int> > ** inverted_indexes ,int nqf,
-// 							 uint64_t*  key_c, uint64_t* tag_c,uint64_t* count_c)
+// 							 uint64_t*  key_c, uint64_t* label_c,uint64_t* count_c)
 // {
 //
 // 	std::string index_key="";
@@ -2872,7 +3428,7 @@ void subtractFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
 // 				index_key+=';';
 // 			}
 // 			else{
-// 				auto it=inverted_indexes[i]->find(tag_arr[i]);
+// 				auto it=inverted_indexes[i]->find(label_arr[i]);
 // 				for(auto k:it->second){
 // 					index_key+=std::to_string(k);
 // 					index_key+=';';
@@ -2882,20 +3438,20 @@ void subtractFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
 // 		}
 // 	}
 // 	index_key.pop_back();
-// 	auto it=Tags_map.find(index_key);
-// 	if(it==Tags_map.end())
+// 	auto it=Labels_map.find(index_key);
+// 	if(it==Labels_map.end())
 // 	{
 //
-// 		Tags_map.insert(std::make_pair(index_key,Tags_map.size()));
-// 		it=Tags_map.find(index_key);
+// 		Labels_map.insert(std::make_pair(index_key,Labels_map.size()));
+// 		it=Labels_map.find(index_key);
 // 	}
-// 	*tag_c=it->second;
+// 	*label_c=it->second;
 //
 // }
 //
-// void inverted_union_multi_no_count_Fn(uint64_t   key_arr[], uint64_t  tag_arr[],uint64_t  count_arr[],
+// void inverted_union_multi_no_count_Fn(uint64_t   key_arr[], uint64_t  label_arr[],uint64_t  count_arr[],
 // 									std::map<uint64_t, std::vector<int> > ** inverted_indexes, int nqf,
-// 							 uint64_t*  key_c, uint64_t* tag_c,uint64_t* count_c)
+// 							 uint64_t*  key_c, uint64_t* label_c,uint64_t* count_c)
 // {
 // 	std::string index_key="";
 // 	*count_c=0;
@@ -2910,7 +3466,7 @@ void subtractFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
 // 				index_key+=';';
 // 			}
 // 			else{
-// 				auto it=inverted_indexes[i]->find(tag_arr[i]);
+// 				auto it=inverted_indexes[i]->find(label_arr[i]);
 // 				for(auto k:it->second){
 // 					index_key+=std::to_string(k);
 // 					index_key+=';';
@@ -2920,13 +3476,13 @@ void subtractFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
 // 		}
 // 	}
 // 	index_key.pop_back();
-// 	auto it=Tags_map.find(index_key);
-// 	if(it==Tags_map.end())
+// 	auto it=Labels_map.find(index_key);
+// 	if(it==Labels_map.end())
 // 	{
 //
-// 		Tags_map.insert(std::make_pair(index_key,last_index));
+// 		Labels_map.insert(std::make_pair(index_key,last_index));
 // 		last_index++;
-// 		it=Tags_map.find(index_key);
+// 		it=Labels_map.find(index_key);
 // 	}
 // 	*count_c=it->second;
 //
@@ -2936,43 +3492,43 @@ void subtractFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
 // void onDiskMQF_invertable_merge(onDiskMQF *onDiskMQF_arr[], int nqf, onDiskMQF *qfr)
 // {
 // 	int i;
-// 	int last_tag=0;
-// 	Tags_map.clear();
+// 	int last_label=0;
+// 	Labels_map.clear();
 // 	last_index=0;
 // 	for(i=0;i<nqf;i++){
-// 		if(onDiskMQF_arr[i]->metadata->tags_map==NULL){
-// 			onDiskMQF_arr[i]->metadata->tags_map=new std::map<uint64_t, std::vector<int> >();
+// 		if(onDiskMQF_arr[i]->metadata->labels_map==NULL){
+// 			onDiskMQF_arr[i]->metadata->labels_map=new std::map<uint64_t, std::vector<int> >();
 // 			vector<int> tmp(1);
 // 			tmp[0]=last_index;
-// 			Tags_map.insert(std::make_pair(std::to_string(i),last_index++));
-// 			onDiskMQF_arr[i]->metadata->tags_map->insert(make_pair(0,tmp));
+// 			Labels_map.insert(std::make_pair(std::to_string(i),last_index++));
+// 			onDiskMQF_arr[i]->metadata->labels_map->insert(make_pair(0,tmp));
 // 		}
 // 		else{
-// 			auto it=onDiskMQF_arr[i]->metadata->tags_map->begin();
-// 			int updated_tags=0;
-// 			while(it!=onDiskMQF_arr[i]->metadata->tags_map->end()){
+// 			auto it=onDiskMQF_arr[i]->metadata->labels_map->begin();
+// 			int updated_labels=0;
+// 			while(it!=onDiskMQF_arr[i]->metadata->labels_map->end()){
 // 				for(int j=0;j<it->second.size();j++){
-// 					it->second[j]+=last_tag;
-// 					auto it2=Tags_map.find(std::to_string(it->second[j]));
-// 					if(it2==Tags_map.end()){
-// 						Tags_map.insert(std::make_pair(std::to_string(it->second[j]),it->second[j]));
-// 						updated_tags++;
+// 					it->second[j]+=last_label;
+// 					auto it2=Labels_map.find(std::to_string(it->second[j]));
+// 					if(it2==Labels_map.end()){
+// 						Labels_map.insert(std::make_pair(std::to_string(it->second[j]),it->second[j]));
+// 						updated_labels++;
 // 					}
 // 				}
 // 				it++;
 // 			}
 // 		}
-// 		last_tag+=Tags_map.size();
+// 		last_label+=Labels_map.size();
 // 	}
 //
 //
 //
 // 	_onDiskMQF_multi_merge(onDiskMQF_arr,nqf,qfr,inverted_union_multi_Fn);
-// 	qfr->metadata->tags_map=new std::map<uint64_t, std::vector<int> >();
-// 	auto it=Tags_map.begin();
-// 	while(it!=Tags_map.end()){
+// 	qfr->metadata->labels_map=new std::map<uint64_t, std::vector<int> >();
+// 	auto it=Labels_map.begin();
+// 	while(it!=Labels_map.end()){
 // 		std::vector<int> tmp=key_to_vector_int(it->first);
-// 		qfr->metadata->tags_map->insert(std::make_pair(it->second,tmp));
+// 		qfr->metadata->labels_map->insert(std::make_pair(it->second,tmp));
 // 		it++;
 //
 // 	}
@@ -2984,43 +3540,43 @@ void subtractFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
 // {
 //
 // 	int i;
-// 	int last_tag=0;
-// 	Tags_map.clear();
+// 	int last_label=0;
+// 	Labels_map.clear();
 // 	last_index=0;
 // 	for(i=0;i<nqf;i++){
-// 		if(onDiskMQF_arr[i]->metadata->tags_map==NULL){
-// 			onDiskMQF_arr[i]->metadata->tags_map=new std::map<uint64_t, std::vector<int> >();
+// 		if(onDiskMQF_arr[i]->metadata->labels_map==NULL){
+// 			onDiskMQF_arr[i]->metadata->labels_map=new std::map<uint64_t, std::vector<int> >();
 // 			vector<int> tmp(1);
 // 			tmp[0]=last_index;
-// 			Tags_map.insert(std::make_pair(std::to_string(i),last_index++));
-// 			onDiskMQF_arr[i]->metadata->tags_map->insert(make_pair(0,tmp));
+// 			Labels_map.insert(std::make_pair(std::to_string(i),last_index++));
+// 			onDiskMQF_arr[i]->metadata->labels_map->insert(make_pair(0,tmp));
 // 		}
 // 		else{
-// 			auto it=onDiskMQF_arr[i]->metadata->tags_map->begin();
-// 			int updated_tags=0;
-// 			while(it!=onDiskMQF_arr[i]->metadata->tags_map->end()){
+// 			auto it=onDiskMQF_arr[i]->metadata->labels_map->begin();
+// 			int updated_labels=0;
+// 			while(it!=onDiskMQF_arr[i]->metadata->labels_map->end()){
 // 				for(int j=0;j<it->second.size();j++){
-// 					it->second[j]+=last_tag;
-// 					auto it2=Tags_map.find(std::to_string(it->second[j]));
-// 					if(it2==Tags_map.end()){
-// 						Tags_map.insert(std::make_pair(std::to_string(it->second[j]),it->second[j]));
-// 						updated_tags++;
+// 					it->second[j]+=last_label;
+// 					auto it2=Labels_map.find(std::to_string(it->second[j]));
+// 					if(it2==Labels_map.end()){
+// 						Labels_map.insert(std::make_pair(std::to_string(it->second[j]),it->second[j]));
+// 						updated_labels++;
 // 					}
 // 				}
 // 				it++;
 // 			}
 // 		}
-// 		last_tag+=Tags_map.size();
+// 		last_label+=Labels_map.size();
 // 	}
 //
 //
 // 	_onDiskMQF_multi_merge(onDiskMQF_arr,nqf,qfr,inverted_union_multi_no_count_Fn);
 //
-// 	qfr->metadata->tags_map=new std::map<uint64_t, std::vector<int> >();
-// 	auto it=Tags_map.begin();
-// 	while(it!=Tags_map.end()){
+// 	qfr->metadata->labels_map=new std::map<uint64_t, std::vector<int> >();
+// 	auto it=Labels_map.begin();
+// 	while(it!=Labels_map.end()){
 // 		std::vector<int> tmp=key_to_vector_int(it->first);
-// 		qfr->metadata->tags_map->insert(std::make_pair(it->second,tmp));
+// 		qfr->metadata->labels_map->insert(std::make_pair(it->second,tmp));
 // 		it++;
 // 	}
 //
@@ -3044,10 +3600,10 @@ void subtractFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
 // 	onDiskMQF* newQF=(onDiskMQF *)calloc(sizeof(QF), 1);
 // 	if(newFilename)
 // 	{
-// 		//onDiskMQF_init(newQF, (1ULL<<newQ),qf->metadata->key_bits, qf->metadata->tag_bits,qf->metadata->fixed_counter_size, false, newFilename, 2038074761);
+// 		//onDiskMQF_init(newQF, (1ULL<<newQ),qf->metadata->key_bits, qf->metadata->label_bits,qf->metadata->fixed_counter_size, false, newFilename, 2038074761);
 // 	}
 // 	else{
-// 		//onDiskMQF_init(newQF, (1ULL<<newQ),qf->metadata->key_bits, qf->metadata->tag_bits,qf->metadata->fixed_counter_size, true, "" , 2038074761);
+// 		//onDiskMQF_init(newQF, (1ULL<<newQ),qf->metadata->key_bits, qf->metadata->label_bits,qf->metadata->fixed_counter_size, true, "" , 2038074761);
 // 	}
 // 	onDiskMQFIterator qfi;
 // 	onDiskMQF_iterator( &qfi, 0);
@@ -3058,7 +3614,7 @@ void subtractFn(uint64_t  key_a, uint64_t  tag_a,uint64_t  count_a,
 //
 // 	do {
 // 			onDiskMQF_insert(newQF, keya, counta);
-// 			onDiskMQF_add_tag(newQF,keya,valuea);
+// 			onDiskMQF_add_label(newQF,keya,valuea);
 // 			onDiskMQFIterator_next(&qfi);
 // 			onDiskMQFIterator_get(&qfi, &keya, &valuea, &counta);
 // 	} while(!onDiskMQFIterator_end(&qfi));
@@ -3148,27 +3704,32 @@ void _onDiskMQF<bitsPerSlot>::general_unlock(){
 	_onDiskMQF<bitsPerSlot>* qf=this;
 	onDiskMQF_spin_unlock(&qf->mem->general_lock);
 }
-// void onDiskMQF_migrate(onDiskMQF* source, onDiskMQF* dest){
-// 	onDiskMQFIterator source_i;
-// 	if (onDiskMQF_iterator(source, &source_i, 0)) {
-// 		do {
-// 			uint64_t key = 0, value = 0, count = 0;
-// 			onDiskMQFIterator_get(&source_i, &key, &value, &count);
-// 			onDiskMQF_insert(dest, key, count, true, true);
-// 			onDiskMQF_add_tag(dest,key,value);
-// 		} while (!onDiskMQFIterator_next(&source_i));
-// 	}
-// }
+ void onDiskMQF::migrate(onDiskMQF* dest){
+ 	onDiskMQFIterator source_i;
+ 	if (getIterator(&source_i, 0)) {
+ 		do {
+ 			uint64_t key = 0, value = 0, count = 0;
+ 			source_i.get(&key, &value, &count);
+ 			dest->insert(key, count, true, true);
+ 			dest->add_label(key,value);
+ 		} while (!source_i.next());
+ 	}
+ }
 
 template<uint64_t bitsPerSlot>
 void onDiskMQF_Namespace::_onDiskMQF<bitsPerSlot>::migrateFromQF(QF* source){
+    if(source->metadata->noccupied_slots+ metadata->noccupied_slots >=
+       metadata->maximum_occupied_slots)
+    {
+        throw std::overflow_error("Buffered QF is 95% full, cannot insert more items.");
+    }
 	QFi source_i;
 	if (qf_iterator(source, &source_i, 0)) {
 		do {
 			uint64_t key = 0, value = 0, count = 0;
 			qfi_get(&source_i, &key, &value, &count);
 			insert(key, count, true, true);
-			add_tag(key,value);
+			add_label(key,value);
 		} while (!qfi_next(&source_i));
 	}
 }
