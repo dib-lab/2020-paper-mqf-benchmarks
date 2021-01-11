@@ -95,12 +95,17 @@ int main(int argc, char const *argv[]) {
   dataStructures.push_back(new MQF(estimatedQ-1,p-estimatedQ+1,4));
   dataStructures.push_back(new MQF(estimatedQ-1,p-estimatedQ+1,3));
   dataStructures.push_back(new MQF(estimatedQ-1,p-estimatedQ+1,2));
-
+  dataStructures.push_back(new MQF(estimatedQ-1,p-estimatedQ+1,1));
+  dataStructures.push_back(new MQF(estimatedQ-2,p-estimatedQ+2,4));
+  dataStructures.push_back(new MQF(estimatedQ-2,p-estimatedQ+2,3));
+  dataStructures.push_back(new MQF(estimatedQ-2,p-estimatedQ+2,2));
+  dataStructures.push_back(new MQF(estimatedQ-2,p-estimatedQ+2,1));
 
 
   dataStructures.push_back(new CQF(estimatedQ+1,p-estimatedQ-1));
   dataStructures.push_back(new CQF(estimatedQ,p-estimatedQ));
   dataStructures.push_back(new CQF(estimatedQ-1,p-estimatedQ+1));
+   dataStructures.push_back(new CQF(estimatedQ-2,p-estimatedQ+2));
 
   //dataStructures.push_back(new LMQF(estimatedQ-1,estimatedQ-2,p-estimatedQ+1,2));
   //dataStructures.push_back(new LMQF(estimatedQ-1,estimatedQ-3,p-estimatedQ+1,2));
@@ -131,7 +136,7 @@ int main(int argc, char const *argv[]) {
   map<uint64_t,uint64_t> gold;
 
 
-
+ 
   generator *g;
   if(distribution=="uniform")
   {
