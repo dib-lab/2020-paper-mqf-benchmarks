@@ -1,0 +1,37 @@
+datasets=["ERR1050075_1.fastq", "ERR992657_2.fastq", "SRR12801265.fastq", "SRR12873993.fastq", "SRR12989394.fastq", "SRR8653791.fastq"]
+
+size=["100", "200", "300", "400", "500", "600", "700", "800", "900", "1000", "1100", "1200", "1300", "1400", "1500", "1600", "1700", "1800", "1900", "2000"]
+
+
+dist=[2 ,3 ,5]
+fpr = [0.0001, 0.001, 0.01, 0.1]
+trials= [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+trials2= [1, 2, 3, 4, 5]
+
+rule all:
+    input:
+        expand("res/speed.z{dist}.s28.f{fpr}.{trial}",dist=dist,fpr=fpr,trial=trials),
+	expand("res/speed.kmers.{file}.s28.f{fpr}.{trial}",file=datasets,fpr=fpr,trial=trials2)
+
+rule speedDist:
+    output:
+        "res/speed.z{dist}.s28.f{fpr}.{trial}"
+    log:
+        "res/speed.z{dist}.s28.f{fpr}.{trial}.log"
+    shell:
+        """
+		./speedPerformance -z {wildcards.dist} -s 28  -f {wildcards.fpr}  > {output} 2> {log}
+	"""
+
+rule speedDistKmers:
+    input:
+        "{file}"
+    output:
+        "res/speed.kmers.{file}.s28.f{fpr}.{trial}"
+    log:
+        "res/speed.kmers.{file}.s28.f{fpr}.{trial}.log"
+    shell:
+        """
+		./speedPerformance  -s 28 -d kmers -k {input}  -f {wildcards.fpr}  > {output} 2> {log}
+	"""
+

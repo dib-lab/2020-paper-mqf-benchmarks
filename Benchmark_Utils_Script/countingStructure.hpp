@@ -148,9 +148,11 @@ public:
   :countingStructure()
   {
     name="Buffered MQF";
-
+    srand( (unsigned)time(NULL) );
+    int n=rand();
+    string filename="tmp.ser"+to_string(n);
     //cout<<bsize<<endl;
-    bufferedMQF_init(&mqf,(1ULL<<qbits), (1ULL<<diskqbits), diskqbits+slot_size, 0,fixedCounterSize, "tmp.ser");
+    bufferedMQF_init(&mqf,(1ULL<<qbits), (1ULL<<diskqbits), diskqbits+slot_size, 0,fixedCounterSize, filename.c_str());
     bsize=mqf.disk->stxxlBufferSize;
     size=mqf.memoryBuffer->metadata->size
     + mqf.disk->stxxlBufferSize*1024*1024;

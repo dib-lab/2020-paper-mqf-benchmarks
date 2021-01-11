@@ -180,18 +180,22 @@ int main(int argc, char const *argv[]) {
      countedKmers+=BufferSize;
      steps.push_back(countedKmers);
      moreWork=false;
+     bool checkAfter=true;
      for(auto structure: dataStructures){
 
 
        cerr<<"Inserting "<<BufferSize<<" to "<<structure->name<<"("<<structure->space()<<"%)"<<endl;
        int j=0;
        for(;j<BufferSize;j++){
-         if(structure->space()>90)
+         if(structure->space()>90){
+	   checkAfter=false;
             break;
+	 }
           structure->insert(insertions[j],1);
         }
-        if(structure->space()<90)
+       if(structure->space()<90){
           moreWork=true;
+       }
         if(j==BufferSize){
           structure->loadingFactors.push_back(structure->space());
         }
@@ -199,6 +203,19 @@ int main(int argc, char const *argv[]) {
           structure->loadingFactors.push_back(0);
         }
      }
+     if(checkAfter)
+       {
+	 
+	 for(unsigned j=0;j<BufferSize;j++){
+          uint64_t MQFValue =dataStructures[0]->query(insertions[j]);
+	  uint64_t CQFValue =dataStructures[0]->query(insertions[j]);
+	  if(MQFValue != CQFValue)
+	    {
+	      cerr<<"MQF query failed. It doesnt return value as CQF"<<endl;
+	    }
+	  
+        }
+       }
 
   }
 
