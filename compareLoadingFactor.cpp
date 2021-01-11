@@ -82,7 +82,7 @@ int main(int argc, char const *argv[]) {
 
   num_elements=(1ULL<<qbits)*5;
   cout<<"Number of elements = "<<num_elements<<endl;
-  uint64_t BufferSize=num_elements/10;
+  uint64_t BufferSize=num_elements/50;
   uint64_t num_queries=num_elements/8;
 
   vector<countingStructure*> dataStructures;
