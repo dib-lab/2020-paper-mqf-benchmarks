@@ -19,8 +19,82 @@ using namespace std;
 
 #include <iostream>
 
+inline uint64_t estimateMemory(uint64_t nslots, uint64_t slotSize, uint64_t fcounter, uint64_t tagSize) {
+    uint64_t SLOTS_PER_BLOCK_t = 64;
+    uint64_t xnslots = nslots + 10 * sqrt((double) nslots);
+    uint64_t nblocks = (xnslots + SLOTS_PER_BLOCK_t - 1) / SLOTS_PER_BLOCK_t;
+    uint64_t blocksize = 17;
+
+    return ((nblocks) * (blocksize + 8 * (slotSize + fcounter + tagSize))) / 1024;
+
+}
+
+bool isEnough(vector<uint64_t>& histogram, uint64_t noSlots, uint64_t fixedSizeCounter, uint64_t slotSize) {
+    // cout<<"noSlots= "<<noSlots<<endl
+    //     <<"fcounter= "<<fixedSizeCounter<<endl
+    //     <<"slot size= "<<numHashBits<<endl;
+
+    noSlots = (uint64_t) ((double) noSlots * 0.90);
+    for (uint64_t i = 1; i < 1000; i++) {
+        uint64_t usedSlots = 1;
+
+        if (i > ((1ULL) << fixedSizeCounter) - 1) {
+            uint64_t nSlots2 = 0;
+            __uint128_t capacity;
+            do {
+                nSlots2++;
+                capacity = ((__uint128_t) (1ULL) << (nSlots2 * slotSize + fixedSizeCounter)) - 1;
+                //  cout<<"slots num "<<nSlots2<<" "<<capacity<<endl;
+            } while ((__uint128_t) i > capacity);
+            usedSlots += nSlots2;
+        }
+        //cout<<"i= "<<i<<"->"<<usedSlots<<" * "<<histogram[i]<<endl;
+        if (noSlots >= (usedSlots * histogram[i])) {
+            noSlots -= (usedSlots * histogram[i]);
+        } else {
+            //  cout<<"failed"<<endl<<endl;
+            return false;
+        }
+
+    }
+    //cout<<"success"<<endl<<endl;
+    return true;
+}
+void estimateMemRequirement(vector<uint64_t>& histogram,
+                            uint64_t numHashBits, uint64_t tagSize,
+                            uint64_t *res_noSlots, uint64_t *res_fixedSizeCounter, uint64_t *res_memory) {
+    uint64_t noDistinctKmers = 0, totalNumKmers=0;
+    *res_memory = numeric_limits<uint64_t>::max();
+    for (int i = 8; i < 64; i++) {
+        uint64_t noSlots = (1ULL) << i;
+        if (noSlots < noDistinctKmers)
+            continue;
+        bool moreWork = false;
+        uint64_t slotSize = numHashBits - log2((double) noSlots);
+        for (uint64_t fixedSizeCounter = 1; fixedSizeCounter < slotSize; fixedSizeCounter++) {
+            if (isEnough(histogram, noSlots, fixedSizeCounter, slotSize)) {
+                uint64_t tmpMem = estimateMemory(noSlots, slotSize, fixedSizeCounter, tagSize);
+                if (*res_memory > tmpMem) {
+                    *res_memory = tmpMem;
+                    *res_fixedSizeCounter = fixedSizeCounter;
+                    *res_noSlots = noSlots;
+                    moreWork = true;
+                } else {
+                    break;
+                }
+            }
+
+        }
+        if (!moreWork && *res_memory != numeric_limits<uint64_t>::max())
+            break;
+    }
+    if (*res_memory == numeric_limits<uint64_t>::max()) {
+        throw std::overflow_error(
+                "Data limits exceeds MQF capabilities(> uint64). Check if ntcard file is corrupted");
+    }
 
 
+}
 
 int main(int argc, char const *argv[]) {
 
@@ -324,6 +398,31 @@ int main(int argc, char const *argv[]) {
           <<structure->fpr10<<"\t"
           <<structure->fpr20<<"\t"
           <<structure->fpr30<<endl;
+  }
+  vector<uint64_t> histogram(10000);
+  for(auto structure: dataStructures)
+  {
+      if(structure->name=="MQF" && !structure->failed)
+      {
+          QF* mqf=((MQF*)structure)->get_MQF();
+          QFi iterator;
+          qf_iterator(mqf,&iterator,0);
+          while(!qfi_end(&iterator))
+          {
+              uint64_t key,count,tag;
+              qfi_get(&iterator,&key,&tag,&count);
+              histogram[count]++;
+              qfi_next(&iterator);
+          }
+          uint64_t res_noSlots,res_fixedSizeCounter, res_memory;
+          estimateMemRequirement(histogram,p,0,&res_noSlots, &res_fixedSizeCounter,&res_memory);
+          cout<<"Estimated number Slots = "<<res_noSlots<<endl;
+          cout<<"Estimated Fixed Size counter = "<<res_fixedSizeCounter<<endl;
+          cout<<"Estimated memory = "<<res_memory<<endl;
+
+          break;
+      }
+
   }
   //
   //   now = std::chrono::high_resolution_clock::now();
