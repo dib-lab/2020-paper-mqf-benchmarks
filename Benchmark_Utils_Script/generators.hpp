@@ -286,6 +286,8 @@ public:
   kmersGenerator(uint64_t num_elements,string fastaFilePath, uint64_t kSize)
   {
     iss= new klibpp::SeqStreamIn(fastaFilePath.c_str());
+    for(int i=0;i<100;i++)//skip first million reads
+          buffRecords=iss->read(10000);
     buffRecords=iss->read(10000);
     buffTop=0;
     record=buffRecords[buffTop++];

@@ -34,7 +34,7 @@ bool isEnough(vector<uint64_t>& histogram, uint64_t noSlots, uint64_t fixedSizeC
     //     <<"fcounter= "<<fixedSizeCounter<<endl
     //     <<"slot size= "<<numHashBits<<endl;
 
-    noSlots = (uint64_t) ((double) noSlots * 0.90);
+    noSlots = (uint64_t) ((double) noSlots * 0.95);
     for (uint64_t i = 1; i < 1000; i++) {
         uint64_t usedSlots = 1;
 
@@ -77,7 +77,7 @@ void estimateMemRequirement(vector<uint64_t>& histogram,
                 if (*res_memory > tmpMem) {
                     *res_memory = tmpMem;
                     *res_fixedSizeCounter = fixedSizeCounter;
-                    *res_noSlots = noSlots;
+                    *res_noSlots = i;
                     moreWork = true;
                 } else {
                     break;
@@ -163,13 +163,17 @@ int main(int argc, char const *argv[]) {
   vector<countingStructure*> dataStructures;
 
   dataStructures.push_back(new MQF(estimatedQ+1,p-estimatedQ-1,1));
+  dataStructures.push_back(new MQF(estimatedQ,p-estimatedQ,5));
+  dataStructures.push_back(new MQF(estimatedQ,p-estimatedQ,4));
   dataStructures.push_back(new MQF(estimatedQ,p-estimatedQ,3));
   dataStructures.push_back(new MQF(estimatedQ,p-estimatedQ,2));
   dataStructures.push_back(new MQF(estimatedQ,p-estimatedQ,1));
+  dataStructures.push_back(new MQF(estimatedQ-1,p-estimatedQ+1,5));
   dataStructures.push_back(new MQF(estimatedQ-1,p-estimatedQ+1,4));
   dataStructures.push_back(new MQF(estimatedQ-1,p-estimatedQ+1,3));
   dataStructures.push_back(new MQF(estimatedQ-1,p-estimatedQ+1,2));
   dataStructures.push_back(new MQF(estimatedQ-1,p-estimatedQ+1,1));
+  dataStructures.push_back(new MQF(estimatedQ-2,p-estimatedQ+2,5));
   dataStructures.push_back(new MQF(estimatedQ-2,p-estimatedQ+2,4));
   dataStructures.push_back(new MQF(estimatedQ-2,p-estimatedQ+2,3));
   dataStructures.push_back(new MQF(estimatedQ-2,p-estimatedQ+2,2));
@@ -421,7 +425,7 @@ int main(int argc, char const *argv[]) {
           }
           uint64_t res_noSlots,res_fixedSizeCounter, res_memory;
           estimateMemRequirement(histogram,p,0,&res_noSlots, &res_fixedSizeCounter,&res_memory);
-          cout<<"Estimated number Slots = "<<res_noSlots<<endl;
+          cout<<"Estimated Q = "<<res_noSlots<<endl;
           cout<<"Estimated Fixed Size counter = "<<res_fixedSizeCounter<<endl;
           cout<<"Estimated memory = "<<res_memory<<endl;
 
